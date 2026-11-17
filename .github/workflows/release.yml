@@ -1,0 +1,73 @@
+name: Sync Chatflix APK Release to Turso
+
+on:
+  release:
+    types: [published, edited]
+
+jobs:
+  sync-turso:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract APK Asset & Update Turso
+        env:
+          TURSO_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          RELEASE_JSON: ${{ toJson(github.event.release) }}
+        run: |
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          NOTES=$(echo "$RELEASE_JSON" | jq -r '.body // ""')
+          
+          # Find the first attached .apk file in the release assets
+          APK_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+
+          if [ -z "$APK_URL" ] || [ "$APK_URL" == "null" ]; then
+            echo "❌ No .apk file attached to release $TAG. Attach your APK and re-run or edit the release."
+            exit 1
+          fi
+
+          # Add [force] anywhere in your GitHub Release notes to make the update mandatory
+          FORCE=0
+          if [[ "$NOTES" == *"[force]"* ]]; then
+            FORCE=1
+          fi
+
+          # Convert libsql:// to https:// for Turso HTTP API
+          HTTP_URL="${TURSO_URL/#libsql:\/\//https://}"
+
+          PAYLOAD=$(jq -n \
+            --arg tag "$TAG" \
+            --arg url "$APK_URL" \
+            --arg notes "$NOTES" \
+            --argjson force "$FORCE" \
+            '{
+              requests: [
+                {
+                  type: "execute",
+                  stmt: {
+                    sql: "INSERT INTO app_releases (id, version_tag, apk_url, release_notes, force_update, published_at) VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET version_tag = excluded.version_tag, apk_url = excluded.apk_url, release_notes = excluded.release_notes, force_update = excluded.force_update, published_at = CURRENT_TIMESTAMP",
+                    args: [
+                      { type: "text", value: $tag },
+                      { type: "text", value: $url },
+                      { type: "text", value: $notes },
+                      { type: "integer", value: ($force | tostring) }
+                    ]
+                  }
+                },
+                { type: "close" }
+              ]
+            }')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$HTTP_URL/v2/pipeline" \
+            -H "Authorization: Bearer $TURSO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          STATUS=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$STATUS" -ne 200 ]; then
+            echo "❌ Turso sync failed ($STATUS): $BODY"
+            exit 1
+          fi
+
+          echo "✅ Synced Chatflix $TAG to Turso! Download URL: $APK_URL"
